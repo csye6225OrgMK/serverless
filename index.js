@@ -51,7 +51,7 @@ async function handler(event) {
         
         if (!isValidUrl(githubRepoUrl)) {
           console.error('Invalid GitHub repository URL');
-          await send(userEmail, 'Please submit a valid url', snsMessage, bucketUrl);
+          await sendEmail(userEmail, 'Please submit a valid url', snsMessage, bucketUrl);
           await track(userEmail, 'Submitted url is not valid');
           return; 
         }
