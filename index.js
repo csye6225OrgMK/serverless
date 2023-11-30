@@ -10,64 +10,97 @@ const mg = mailgun({ apiKey: process.env.MAILGUN_API_KEY, domain: process.env.DO
 const dynamoDBName = process.env.DYNAMODB_TABLE_NAME;
 const dynamoDB = new AWS.DynamoDB.DocumentClient();
 
-console.log('DB NAME:', dynamoDB);
-
 const GCP_decodedPrivateKey = Buffer.from(process.env.GCP_SERVICE_ACCOUNT_KEY, 'base64').toString('utf-8');
 const GCP_keyFileJson = JSON.parse(GCP_decodedPrivateKey);
-
 
 const storage = new Storage({
   projectId: process.env.GCP_PROJECT_ID,
   credentials: GCP_keyFileJson,
 });
 
-console.log(process.env.GCP_SERVICE_ACCOUNT_KEY, GCP_keyFileJson);
-console.log(process.env.GCP_PROJECT_ID);
-console.log(process.env.MAILGUN_API_KEY);
-console.log(process.env.DYNAMODB_TABLE_NAME);
-console.log(process.env.DOMAIN);
-
 async function handler(event) {
   try {
-    // const [buckets] = await storage.getBuckets();
-    const snsMessage = JSON.parse(event.Records[0].Sns.Message);
-    const userEmail = snsMessage.userEmail;
-    console.log('userEmail: ',userEmail, 'typeof: ', typeof userEmail);
-    const githubRepoUrl = snsMessage.githubRepoUrl;
-    const bucketName = process.env.GOOGLE_STORAGE_BUCKET_NAME;
-    const fileName = 'release.zip';
-    
-    const response = await fetch(githubRepoUrl);
-
-    if (!response.ok) {
-      await sendEmail(userEmail, 'Error downloading release from GitHub');
-      await trackEmail(userEmail, 'Error downloading release from GitHub');
-      return;
+    if (!event || !event.Records) {
+      throw new Error('Invalid event or missing Records');
     }
 
-    const buffer = await response.buffer();
+    const snsRecords = event.Records.filter(
+      (record) => record.EventSource === 'aws:sns'
+    );
 
-    try {
-      // Upload the buffer to Google Cloud Storage
-      await storage.bucket(bucketName).file(fileName).save(buffer);
-      await sendEmail(userEmail, 'Release download and upload successful');
-      await trackEmail(userEmail, 'Release download and upload successful');
-    } catch (error) {
-      await sendEmail(userEmail, 'Error uploading release to Google Cloud Storage');
-      await trackEmail(userEmail, 'Error uploading release to Google Cloud Storage');
-      return;
+    for (const snsRecord of snsRecords) {
+      if (snsRecord.Sns && snsRecord.Sns.Message) {
+        console.log('SNS Message:', snsRecord.Sns.Message);
+        const snsMessage = JSON.parse(snsRecord.Sns.Message);
+        console.log('SNS Message After parsing:', snsMessage);
+        const userEmail = snsMessage.userEmail;
+        const githubRepoUrl = snsMessage.githubRepoUrl;
+        const bucketName = process.env.GOOGLE_STORAGE_BUCKET_NAME;
+        const bucketUrl = process.env.GOOGLE_STORAGE_BUCKET_URL;
+        const rejectionReason = snsMessage.rejectionReason;
+        const fileName = `AssignmentSubmission${Date.now()}.zip`;
+
+        const isValidUrl = (url) => {
+          try {
+            const urlObj = new URL(url);
+            return urlObj.pathname.endsWith('.zip'); // Check if the URL ends with .zip
+          } catch (error) {
+            return false;
+          }
+        };
+        
+        if (!isValidUrl(githubRepoUrl)) {
+          console.error('Invalid GitHub repository URL');
+          await send(userEmail, 'Please submit a valid url', snsMessage, bucketUrl);
+          await track(userEmail, 'Submitted url is not valid');
+          return; 
+        }
+        
+        const response = await fetch(githubRepoUrl); 
+
+        if (!response.ok) {
+          await sendEmail(userEmail, 'Error downloading release from GitHub', snsMessage, bucketUrl);
+          await trackEmail(userEmail, 'Error downloading release from GitHub');
+          return;
+        }
+
+        if (rejectionReason) {
+          await sendEmail(userEmail, 'Your submission has been rejected', snsMessage, bucketUrl);
+          await trackEmail(userEmail, 'Submission rejected');
+          return;
+        }
+
+        const buffer = await response.buffer();
+
+        try {
+          await storage.bucket(bucketName).file(fileName).save(buffer);
+          await sendEmail(userEmail, 'Release download and uploaded successfully to google cloud', snsMessage, bucketUrl);
+          await trackEmail(userEmail, 'Release download and upload successful');
+        } catch (error) {
+          await sendEmail(userEmail, 'Error uploading release to Google Cloud Storage', snsMessage, bucketUrl);
+          await trackEmail(userEmail, 'Error uploading release to Google Cloud Storage');
+          return;
+        }
+      } else {
+        console.error('SNS record does not contain expected message data');
+      }
     }
   } catch (error) {
     console.error('Error in handler function:', error);
   }
 }
 
-async function sendEmail(email, message) {
+async function sendEmail(email, message, snsMessage, bucketUrl) {
   const data = {
-    from: 'csye6225mk@demo.talentofpainting.info',
-    to: email,
-    subject: 'Details of your assignment submission',
-    text: message,
+    from: 'Madhura Kurhadkar <madhurak@talentofpainting.info>',
+    to: 'madhura.kurhadkar@gmail.com',
+    subject: 'Submission details for assignment: '+snsMessage.assignment,
+    text: `${message}\n\nThank you for your submission! Below are the details:\n\n` +
+      `User Email: ${email}\n` +
+      `Submitted GitHub Repository URL: ${snsMessage.githubRepoUrl}\n` +
+      `Google Bucket URL: ${bucketUrl}\n` +
+      `${snsMessage.rejectionReason ? `Rejection Reason: ${snsMessage.rejectionReason}\n` : ''}` +
+      `If you have any questions or concerns, feel free to reach out.\n\nBest regards,\nMadhura Kurhadkar`,
   };
 
   mg.messages().send(data, (error, body) => {
@@ -83,9 +116,9 @@ async function trackEmail(email, status) {
   const params = {
     TableName: dynamoDBName,
     Item: {
-      'emailId': { S: email },
-      'Status': { S: status },
-      'sentAt': { N: `${Date.now()}` },
+      'emailId': email,
+      'Status': status,
+      'sentAt': `${Date.now()}`,
     },
   };
 
